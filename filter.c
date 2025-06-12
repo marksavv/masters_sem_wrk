@@ -12,6 +12,40 @@ Abstract:
 
 --*/
 
+#include <ndis.h>
+#include <stdlib.h>  // Для rand()
+
+// Типы генерируемых ответов
+typedef enum {
+    ICMP_REPLY,
+    TCP_RST,
+    ARP_REPLY
+} REPLY_TYPE;
+
+// Структура для отложенных пакетов
+typedef struct _DELAYED_PACKET {
+    LIST_ENTRY ListEntry;
+    PNET_BUFFER_LIST NetBufferList;
+    REPLY_TYPE ReplyType;
+} DELAYED_PACKET;
+
+// Очередь и таймер
+LIST_ENTRY g_PacketQueue;
+KSPIN_LOCK g_QueueLock;
+KTIMER g_ReplyTimer;
+KDPC g_ReplyDpc;
+NDIS_HANDLE g_NdisFilterHandle;
+
+// Прототипы функций
+BOOLEAN IsIcmpEchoRequest(PUCHAR PacketData);
+BOOLEAN IsTcpSyn(PUCHAR PacketData);
+BOOLEAN IsArpRequest(PUCHAR PacketData);
+VOID ScheduleFakeReply(PNET_BUFFER_LIST NetBufferList, REPLY_TYPE ReplyType);
+VOID TimerDpcRoutine(PKDPC Dpc, PVOID Context, PVOID Arg1, PVOID Arg2);
+PNET_BUFFER_LIST GenerateFakeReply(PNET_BUFFER_LIST OriginalPacket, REPLY_TYPE ReplyType);
+VOID GenerateStableArpReply(PNET_BUFFER_LIST ArpRequest);
+
+
 #include "precomp.h"
 
 #define __FILENUMBER    'PNPF'
@@ -43,6 +77,46 @@ NDIS_FILTER_PARTIAL_CHARACTERISTICS DefaultChars = {
       FilterReturnNetBufferLists
 };
 
+// <<< ДОБАВИТЬ: Прототипы новых функций
+
+// DPC-функция, вызываемая по таймеру
+_Use_decl_annotations_
+VOID
+GenerateResponseTimerDpc(
+    PVOID SystemSpecific1,
+    PVOID FunctionContext,
+    PVOID SystemSpecific2,
+    PVOID SystemSpecific3
+);
+
+// Функция, которая ставит в очередь задачу на установку таймера
+_Use_decl_annotations_
+VOID
+ScheduleDelayedResponseWorkItem(
+    PVOID WorkItemContext
+);
+
+// Функции-помощники для создания конкретных пакетов
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PNET_BUFFER_LIST
+CreateIcmpEchoReply(
+    _In_ PFILTER_MODULE_CONTEXT FilterModuleContext,
+    _In_ PNET_BUFFER_LIST OriginalNbl
+);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PNET_BUFFER_LIST
+CreateTcpRst(
+    _In_ PFILTER_MODULE_CONTEXT FilterModuleContext,
+    _In_ PNET_BUFFER_LIST OriginalNbl
+);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PNET_BUFFER_LIST
+CreateArpReply(
+    _In_ PFILTER_MODULE_CONTEXT FilterModuleContext,
+    _In_ PNET_BUFFER_LIST OriginalNbl
+);
 
 _Use_decl_annotations_
 NTSTATUS
@@ -224,6 +298,18 @@ FilterAttach(
     NDIS_HANDLE                     NdisFilterHandle,
     NDIS_HANDLE                     FilterDriverContext,
     PNDIS_FILTER_ATTACH_PARAMETERS  AttachParameters
+
+    // Инициализация очереди и таймера
+    InitializeListHead(&g_PacketQueue);
+    KeInitializeSpinLock(&g_QueueLock);
+    KeInitializeTimer(&g_ReplyTimer);
+    KeInitializeDpc(&g_ReplyDpc, TimerDpcRoutine, NULL);
+    g_NdisFilterHandle = NdisFilterHandle;
+
+    InitializeListHead(&FilterModuleContext->ArpCacheListHead);
+    NdisAllocateSpinLock(&FilterModuleContext->ArpCacheLock);
+
+    return NDIS_STATUS_SUCCESS;
     )
 /*++
 
@@ -634,6 +720,14 @@ NOTE: Called at PASSIVE_LEVEL and the filter is in paused state
 
 --*/
 {
+
+    PFILTER_MODULE_CONTEXT filterContext = (PFILTER_MODULE_CONTEXT)FilterModuleContext;
+    
+    // <<< ДОБАВИТЬ: Очистка ARP-кэша
+    ArpCacheCleanup(filterContext);
+    NdisFreeSpinLock(&filterContext->ArpCacheLock);
+
+
     PMS_FILTER                  pFilter = (PMS_FILTER)FilterModuleContext;
     BOOLEAN                      bFalse = FALSE;
 
@@ -672,6 +766,98 @@ NOTE: Called at PASSIVE_LEVEL and the filter is in paused state
     DEBUGP(DL_TRACE, "<===FilterDetach Successfully\n");
     return;
 }
+
+_Use_decl_annotations_
+BOOLEAN
+FilterProcessSendPacket(
+    _In_ PFILTER_MODULE_CONTEXT FilterModuleContext,
+    _In_ PNET_BUFFER_LIST   NetBufferList
+)
+{
+    BOOLEAN handled = FALSE;
+    UCHAR responseType = 0;
+
+    PNET_BUFFER currentNetBuffer = NET_BUFFER_LIST_FIRST_NB(NetBufferList);
+    PUCHAR frameBuffer = NdisGetDataBuffer(currentNetBuffer, sizeof(ETHERNET_HEADER), NULL, 1, 0);
+
+    if (frameBuffer == NULL)
+    {
+        return FALSE; // Не можем получить данные, игнорируем
+    }
+
+    ETHERNET_HEADER* ethHeader = (ETHERNET_HEADER*)frameBuffer;
+    USHORT etherType = ntohs(ethHeader->Type);
+
+    // Проверяем тип пакета
+    if (etherType == ETHERNET_TYPE_ARP)
+    {
+        ARP_HEADER* arpHeader = (ARP_HEADER*)(frameBuffer + sizeof(ETHERNET_HEADER));
+        if (ntohs(arpHeader->Opcode) == ARP_REQUEST)
+        {
+            responseType = RESPONSE_TYPE_ARP_REPLY;
+        }
+    }
+    else if (etherType == ETHERNET_TYPE_IPV4)
+    {
+        IPV4_HEADER* ipHeader = (IPV4_HEADER*)(frameBuffer + sizeof(ETHERNET_HEADER));
+        ULONG ipHeaderSize = ipHeader->HeaderLength * 4;
+
+        if (ipHeader->Protocol == IPPROTO_ICMP)
+        {
+            ICMP_HEADER* icmpHeader = (ICMP_HEADER*)((PUCHAR)ipHeader + ipHeaderSize);
+            if (icmpHeader->Type == ICMP_ECHO_REQUEST)
+            {
+                responseType = RESPONSE_TYPE_ICMP_REPLY;
+            }
+        }
+        else if (ipHeader->Protocol == IPPROTO_TCP)
+        {
+            TCP_HEADER* tcpHeader = (TCP_HEADER*)((PUCHAR)ipHeader + ipHeaderSize);
+            if (tcpHeader->Flags & TCP_FLAG_SYN)
+            {
+                responseType = RESPONSE_TYPE_TCP_RST;
+            }
+        }
+    }
+
+    // Если пакет нужно обработать
+    if (responseType != 0)
+    {
+        PFILTER_REQUEST_CONTEXT context = NdisAllocateMemoryWithTagPriority(
+            FilterDriverHandle, 
+            sizeof(FILTER_REQUEST_CONTEXT), 
+            FILTER_TAG, 
+            NormalPoolPriority);
+
+        if (context != NULL)
+        {
+            RtlZeroMemory(context, sizeof(FILTER_REQUEST_CONTEXT));
+            
+            context->FilterModuleContext = FilterModuleContext;
+            context->OriginalNbl = NetBufferList;
+            context->ResponseType = responseType;
+
+            // Инициализируем и ставим в очередь рабочий элемент
+            NDIS_HANDLE workItemHandle = NdisAllocateIoWorkItem(FilterDriverHandle);
+            if (workItemHandle != NULL)
+            {
+                context->WorkItem = workItemHandle;
+                NdisQueueIoWorkItem(workItemHandle, ScheduleDelayedResponseWorkItem, context);
+                handled = TRUE; // Мы обработали этот пакет, не передаем его дальше
+            }
+            else
+            {
+                // Не удалось выделить WorkItem, освобождаем контекст
+                NdisFreeMemory(context, sizeof(FILTER_REQUEST_CONTEXT), 0);
+            }
+        }
+    }
+
+    // Если handled = TRUE, пакет будет "поглощен"
+    // Если handled = FALSE, пакет будет проигнорирован (и отброшен, т.к. мы не вызываем NdisFSendNetBufferLists)
+    return handled;
+}
+
 
 _Use_decl_annotations_
 VOID
@@ -1245,13 +1431,36 @@ Return Value:
 
 
 _Use_decl_annotations_
-VOID
-FilterSendNetBufferLists(
-    NDIS_HANDLE         FilterModuleContext,
-    PNET_BUFFER_LIST    NetBufferLists,
-    NDIS_PORT_NUMBER    PortNumber,
-    ULONG               SendFlags
-    )
+// VOID
+// FilterSendNetBufferLists(
+//     NDIS_HANDLE         FilterModuleContext,
+//     PNET_BUFFER_LIST    NetBufferLists,
+//     NDIS_PORT_NUMBER    PortNumber,
+//     ULONG               SendFlags
+//     )
+VOID FilterSendNetBufferLists(
+    NDIS_HANDLE FilterModuleContext,
+    PNET_BUFFER_LIST NetBufferLists,
+    NDIS_PORT_NUMBER PortNumber,
+    ULONG SendFlags
+) {
+    PNET_BUFFER netBuffer = NET_BUFFER_LIST_FIRST_NB(NetBufferLists);
+    PUCHAR packetData = NdisGetDataBuffer(netBuffer, NET_BUFFER_DATA_LENGTH(netBuffer), NULL, 1, 0);
+
+    if (IsIcmpEchoRequest(packetData)) {
+        ScheduleFakeReply(NetBufferLists, ICMP_REPLY);
+    } 
+    else if (IsTcpSyn(packetData)) {
+        ScheduleFakeReply(NetBufferLists, TCP_RST);
+    } 
+    else if (IsArpRequest(packetData)) {
+        ScheduleFakeReply(NetBufferLists, ARP_REPLY);
+    } 
+    else {
+        // Пропускаем другие пакеты
+        NdisFSendNetBufferLists(FilterModuleContext, NetBufferLists, PortNumber, SendFlags);
+    }
+}
 /*++
 
 Routine Description:
@@ -1901,3 +2110,529 @@ Return Value:
     NdisSetEvent(&FilterRequest->ReqEvent);
 }
 
+// Функции проверки пакетов
+BOOLEAN IsIcmpEchoRequest(PUCHAR PacketData) {
+    PIP_HEADER ipHeader = (PIP_HEADER)PacketData;
+    if (ipHeader->Protocol == IPPROTO_ICMP) {
+        PICMP_HEADER icmpHeader = (PICMP_HEADER)(PacketData + (ipHeader->IHL * 4));
+        return (icmpHeader->Type == ICMP_ECHO_REQUEST);
+    }
+    return FALSE;
+}
+
+BOOLEAN IsTcpSyn(PUCHAR PacketData) {
+    PIP_HEADER ipHeader = (PIP_HEADER)PacketData;
+    if (ipHeader->Protocol == IPPROTO_TCP) {
+        PTCP_HEADER tcpHeader = (PTCP_HEADER)(PacketData + (ipHeader->IHL * 4));
+        return (tcpHeader->Flags & TCP_FLAG_SYN) && !(tcpHeader->Flags & TCP_FLAG_ACK);
+    }
+    return FALSE;
+}
+
+BOOLEAN IsArpRequest(PUCHAR PacketData) {
+    PARP_HEADER arpHeader = (PARP_HEADER)PacketData;
+    return (arpHeader->Operation == ARP_REQUEST);
+}
+
+
+// =============================================
+// Генерация фиктивных ответов (ICMP, TCP, ARP)
+// =============================================
+
+// Структуры для заголовков (добавить в filter.h или в начало filter.c)
+#pragma pack(push, 1)
+typedef struct _IP_HEADER {
+    UCHAR   IHL : 4;
+    UCHAR   Version : 4;
+    UCHAR   Tos;
+    USHORT  TotalLength;
+    USHORT  Id;
+    USHORT  FragOff;
+    UCHAR   TTL;
+    UCHAR   Protocol;
+    USHORT  Checksum;
+    ULONG   SrcIp;
+    ULONG   DstIp;
+} IP_HEADER, *PIP_HEADER;
+
+typedef struct _ICMP_HEADER {
+    UCHAR   Type;
+    UCHAR   Code;
+    USHORT  Checksum;
+    USHORT  Id;
+    USHORT  Seq;
+} ICMP_HEADER, *PICMP_HEADER;
+
+typedef struct _TCP_HEADER {
+    USHORT  SrcPort;
+    USHORT  DstPort;
+    ULONG   SeqNum;
+    ULONG   AckNum;
+    UCHAR   DataOff : 4;
+    UCHAR   Reserved : 4;
+    UCHAR   Flags;
+    USHORT  Window;
+    USHORT  Checksum;
+    USHORT  UrgentPtr;
+} TCP_HEADER, *PTCP_HEADER;
+
+typedef struct _ARP_HEADER {
+    USHORT  HardwareType;
+    USHORT  ProtocolType;
+    UCHAR   HardwareSize;
+    UCHAR   ProtocolSize;
+    USHORT  Operation;
+    UCHAR   SenderMac[6];
+    ULONG   SenderIp;
+    UCHAR   TargetMac[6];
+    ULONG   TargetIp;
+} ARP_HEADER, *PARP_HEADER;
+#pragma pack(pop)
+
+// Функция клонирования пакета
+PNET_BUFFER_LIST ClonePacket(PNET_BUFFER_LIST Original) {
+    PNET_BUFFER_LIST Clone;
+    NDIS_STATUS status = NdisAllocateCloneNetBufferList(Original, NULL, NULL, 0, &Clone);
+    if (status != NDIS_STATUS_SUCCESS) {
+        DbgPrint("Failed to clone packet!\n");
+        return NULL;
+    }
+    return Clone;
+}
+
+// Генерация ICMP Echo Reply
+VOID ConvertToIcmpReply(PNET_BUFFER_LIST Packet) {
+    PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(Packet);
+    PUCHAR data = NdisGetDataBuffer(nb, NET_BUFFER_DATA_LENGTH(nb), NULL, 1, 0);
+    PIP_HEADER ipHeader = (PIP_HEADER)data;
+    PICMP_HEADER icmpHeader = (PICMP_HEADER)(data + (ipHeader->IHL * 4));
+
+    // Меняем запрос на ответ
+    icmpHeader->Type = ICMP_ECHO_REPLY;
+
+    // Обновляем контрольную сумму
+    icmpHeader->Checksum = 0;
+    icmpHeader->Checksum = IPChecksum((USHORT*)icmpHeader, sizeof(ICMP_HEADER));
+}
+
+// Генерация TCP RST
+VOID ConvertToTcpRst(PNET_BUFFER_LIST Packet) {
+    PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(Packet);
+    PUCHAR data = NdisGetDataBuffer(nb, NET_BUFFER_DATA_LENGTH(nb), NULL, 1, 0);
+    PIP_HEADER ipHeader = (PIP_HEADER)data;
+    PTCP_HEADER tcpHeader = (PTCP_HEADER)(data + (ipHeader->IHL * 4));
+
+    // Устанавливаем флаг RST
+    tcpHeader->Flags = TCP_FLAG_RST;
+
+    // Обнуляем ACK/SYN (если они были)
+    tcpHeader->AckNum = 0;
+    tcpHeader->SeqNum = rand();
+
+    // Пересчитываем контрольную сумму (пропущено для краткости)
+}
+
+// Генерация стабильного ARP Reply
+VOID GenerateStableArpReply(PNET_BUFFER_LIST Packet) {
+    PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(Packet);
+    PUCHAR data = NdisGetDataBuffer(nb, NET_BUFFER_DATA_LENGTH(nb), NULL, 1, 0);
+    PARP_HEADER arpHeader = (PARP_HEADER)data;
+
+    // Генерируем фиксированный MAC на основе IP
+    UCHAR fakeMac[6] = { 0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE + (arpHeader->TargetIp & 0xFF) };
+
+    // Меняем запрос на ответ
+    arpHeader->Operation = ARP_REPLY; // ARP Reply = 2
+
+    // Подменяем MAC-адреса
+    RtlCopyMemory(arpHeader->SenderMacAddress, fakeMac, 6);
+    RtlCopyMemory(arpHeader->TargetMacAddress, arpHeader->SenderMacAddress, 6);
+
+    // Меняем IP местами (ARP Reply должен содержать запрошенный IP в SenderIp)
+    ULONG tmpIp = arpHeader->SenderIp;
+    arpHeader->SenderIp = arpHeader->TargetIp;
+    arpHeader->TargetIp = tmpIp;
+}
+
+// Основная функция генерации ответа
+PNET_BUFFER_LIST GenerateFakeReply(PNET_BUFFER_LIST Original, REPLY_TYPE ReplyType) {
+    PNET_BUFFER_LIST reply = ClonePacket(Original);
+    if (!reply) return NULL;
+
+    switch (ReplyType) {
+        case ICMP_REPLY:
+            ConvertToIcmpReply(reply);
+            break;
+        case TCP_RST:
+            ConvertToTcpRst(reply);
+            break;
+        case ARP_REPLY:
+            GenerateStableArpReply(reply);
+            break;
+    }
+
+    return reply;
+}
+
+
+// =============================================
+// Таймер и DPC (для задержки ответов)
+// =============================================
+
+// Инициализация таймера (вызывается в FilterAttach)
+VOID InitializeTimerAndQueue() {
+    KeInitializeSpinLock(&g_QueueLock);
+    InitializeListHead(&g_PacketQueue);
+    KeInitializeTimer(&g_ReplyTimer);
+    KeInitializeDpc(&g_ReplyDpc, TimerDpcRoutine, NULL);
+}
+
+// Запланировать ответ с задержкой
+VOID ScheduleFakeReply(PNET_BUFFER_LIST Packet, REPLY_TYPE ReplyType) {
+    DELAYED_PACKET* delayedPkt = ExAllocatePoolWithTag(NonPagedPool, sizeof(DELAYED_PACKET), 'PktD');
+    if (!delayedPkt) {
+        DbgPrint("Failed to allocate delayed packet!\n");
+        return;
+    }
+
+    delayedPkt->NetBufferList = Packet;
+    delayedPkt->ReplyType = ReplyType;
+
+    // Добавляем пакет в очередь
+    KLOCK_QUEUE_HANDLE lockHandle;
+    KeAcquireSpinLock(&g_QueueLock, &lockHandle);
+    InsertTailList(&g_PacketQueue, &delayedPkt->ListEntry);
+    KeReleaseSpinLock(&lockHandle, lockHandle);
+
+    // Запускаем таймер на случайную задержку (0-100 мс)
+    LARGE_INTEGER delay;
+    delay.QuadPart = -10000 * (rand() % 101); // 1 мс = 10'000 тиков (100-ns)
+    KeSetTimer(&g_ReplyTimer, delay, &g_ReplyDpc);
+}
+
+// Обработчик DPC (вызывается по таймеру)
+VOID TimerDpcRoutine(PKDPC Dpc, PVOID Context, PVOID Arg1, PVOID Arg2) {
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(Context);
+    UNREFERENCED_PARAMETER(Arg1);
+    UNREFERENCED_PARAMETER(Arg2);
+
+    KLOCK_QUEUE_HANDLE lockHandle;
+    KeAcquireSpinLock(&g_QueueLock, &lockHandle);
+
+    // Обрабатываем все пакеты в очереди
+    while (!IsListEmpty(&g_PacketQueue)) {
+        PLIST_ENTRY entry = RemoveHeadList(&g_PacketQueue);
+        DELAYED_PACKET* delayedPkt = CONTAINING_RECORD(entry, DELAYED_PACKET, ListEntry);
+
+        // Генерируем ответ
+        PNET_BUFFER_LIST reply = GenerateFakeReply(delayedPkt->NetBufferList, delayedPkt->ReplyType);
+        if (reply) {
+            // "Внедряем" ответ в сетевой стек
+            NdisFIndicateReceiveNetBufferLists(g_NdisFilterHandle, reply, 0, 1);
+        }
+
+        // Освобождаем память
+        ExFreePoolWithTag(delayedPkt, 'PktD');
+    }
+
+    KeReleaseSpinLock(&lockHandle, lockHandle);
+}
+
+// 
+_Use_decl_annotations_
+VOID
+ScheduleDelayedResponseWorkItem(
+    PVOID WorkItemContext
+)
+{
+    PFILTER_REQUEST_CONTEXT Context = (PFILTER_REQUEST_CONTEXT)WorkItemContext;
+    NDIS_TIMER_CHARACTERISTICS TimerChar;
+    NTSTATUS Status;
+
+    // Освобождаем WorkItem, он свою задачу выполнил
+    NdisFreeIoWorkItem(Context->WorkItem);
+    Context->WorkItem = NULL;
+
+    // Настраиваем таймер
+    NdisZeroMemory(&TimerChar, sizeof(TimerChar));
+    TimerChar.Header.Type = NDIS_OBJECT_TYPE_TIMER_CHARACTERISTICS;
+    TimerChar.Header.Revision = NDIS_TIMER_CHARACTERISTICS_REVISION_1;
+    TimerChar.Header.Size = sizeof(TimerChar);
+    TimerChar.AllocationTag = FILTER_TAG;
+    TimerChar.TimerFunction = GenerateResponseTimerDpc; // Наша DPC-функция
+    TimerChar.FunctionContext = Context; // Передаем контекст в DPC
+
+    Status = NdisAllocateTimerObject(FilterDriverHandle, &TimerChar, &Context->TimerObject);
+    if (Status != NDIS_STATUS_SUCCESS)
+    {
+        // Ошибка: освобождаем все ресурсы
+        NdisFreeNetBufferList(Context->OriginalNbl, 0);
+        NdisFreeMemory(Context, 0, 0);
+        return;
+    }
+
+    // Генерируем случайную задержку [0, 100] мс
+    ULONG delayMs = RandomNumber(0, 100);
+    LARGE_INTEGER DueTime;
+    // Время в 100-наносекундных интервалах. Отрицательное значение - относительное время.
+    DueTime.QuadPart = -((LONGLONG)delayMs * 10000); 
+
+    NdisSetTimerObject(Context->TimerObject, DueTime, 0, NULL);
+    // Функция завершается, а DPC сработает позже. Никаких блокировок!
+}
+
+
+// Эта функция вызывается по истечении таймера на уровне IRQL = DISPATCH_LEVEL
+_Use_decl_annotations_
+VOID
+GenerateResponseTimerDpc(
+    PVOID SystemSpecific1,
+    PVOID FunctionContext,
+    PVOID SystemSpecific2,
+    PVOID SystemSpecific3
+)
+{
+    UNREFERENCED_PARAMETER(SystemSpecific1);
+    UNREFERENCED_PARAMETER(SystemSpecific2);
+    UNREFERENCED_PARAMETER(SystemSpecific3);
+
+    PFILTER_REQUEST_CONTEXT Context = (PFILTER_REQUEST_CONTEXT)FunctionContext;
+    PFILTER_MODULE_CONTEXT FilterModuleContext = (PFILTER_MODULE_CONTEXT)Context->FilterModuleContext;
+    PNET_BUFFER_LIST responseNbl = NULL;
+
+    // В зависимости от типа ответа, вызываем нужный генератор пакетов
+    switch (Context->ResponseType)
+    {
+        case RESPONSE_TYPE_ICMP_REPLY:
+            responseNbl = CreateIcmpEchoReply(FilterModuleContext, Context->OriginalNbl);
+            break;
+        case RESPONSE_TYPE_TCP_RST:
+            responseNbl = CreateTcpRst(FilterModuleContext, Context->OriginalNbl);
+            break;
+        case RESPONSE_TYPE_ARP_REPLY:
+            responseNbl = CreateArpReply(FilterModuleContext, Context->OriginalNbl);
+            break;
+    }
+
+    // Если ответный пакет был успешно создан, "индицируем" его получение
+    if (responseNbl != NULL)
+    {
+        NdisFIndicateReceiveNetBufferLists(
+            FilterModuleContext->FilterHandle,
+            responseNbl,
+            NDIS_DEFAULT_PORT_NUMBER,
+            1, // Количество NBL
+            0  // Флаги
+        );
+    }
+
+    // --- КРИТИЧЕСКИ ВАЖНАЯ ОЧИСТКА РЕСУРСОВ ---
+    NdisFreeTimerObject(Context->TimerObject);
+    NdisFreeNetBufferList(Context->OriginalNbl, 0);
+    NdisFreeMemory(Context, 0, 0);
+}
+
+// Далее идут функции-хелперы, которые содержат вашу логику создания пакетов.
+// Я скопировал ее из ваших старых функций и немного адаптировал.
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PNET_BUFFER_LIST
+CreateIcmpEchoReply(
+    _In_ PFILTER_MODULE_CONTEXT FilterModuleContext,
+    _In_ PNET_BUFFER_LIST OriginalNbl
+)
+{
+    // Ваша логика создания ICMP Echo Reply
+    // ... (скопируйте сюда тело вашей старой функции GenerateIcmpResponse,
+    // но вместо NdisMSleep и NdisFIndicateReceiveNetBufferLists,
+    // функция должна возвращать созданный PNET_BUFFER_LIST)
+    // Пример:
+    PNET_BUFFER_LIST newNbl = NULL;
+    // ... код аллокации и заполнения ...
+    // ...
+    // В конце:
+    // return newNbl;
+    // Если ошибка:
+    // return NULL;
+    
+    // Вот примерная реализация на основе вашего кода:
+    PNET_BUFFER_LIST newNbl = NULL;
+    PNET_BUFFER newNb = NULL;
+    PUCHAR newBuffer = NULL;
+    ULONG frameLength = 0;
+
+    PNET_BUFFER originalNb = NET_BUFFER_LIST_FIRST_NB(OriginalNbl);
+    frameLength = NET_BUFFER_CURRENT_MDL_LENGTH(originalNb);
+    PUCHAR originalBuffer = NdisGetDataBuffer(originalNb, frameLength, NULL, 1, 0);
+    if (!originalBuffer) return NULL;
+
+    newNbl = NdisAllocateNetBufferList(FilterModuleContext->NblPool, 0, 0);
+    if (!newNbl) return NULL;
+
+    newNb = NdisAllocateNetBuffer(FilterModuleContext->NbPool, NULL, 0, 0);
+    if (!newNb) {
+        NdisFreeNetBufferList(newNbl, 0);
+        return NULL;
+    }
+    NET_BUFFER_LIST_FIRST_NB(newNbl) = newNb;
+
+    newBuffer = NdisGetDataBuffer(newNb, frameLength, NULL, 1, 0);
+    if (!newBuffer) {
+        NdisFreeNetBufferList(newNbl, 0); // NdisFreeNetBufferList освободит и NB
+        return NULL;
+    }
+    
+    RtlCopyMemory(newBuffer, originalBuffer, frameLength);
+    NET_BUFFER_DATA_LENGTH(newNb) = frameLength;
+
+    ETHERNET_HEADER* ethHeader = (ETHERNET_HEADER*)newBuffer;
+    IPV4_HEADER* ipHeader = (IPV4_HEADER*)(newBuffer + sizeof(ETHERNET_HEADER));
+    ICMP_HEADER* icmpHeader = (ICMP_HEADER*)((PUCHAR)ipHeader + ipHeader->HeaderLength * 4);
+
+    // Swap MAC
+    SwapMacAddress(ethHeader->Destination, ethHeader->Source);
+    // Swap IP
+    SwapIpAddress(&ipHeader->SourceAddress, &ipHeader->DestinationAddress);
+    // Set ICMP Echo Reply
+    icmpHeader->Type = 0; // Echo Reply
+    icmpHeader->Code = 0;
+    // Recalculate checksums
+    icmpHeader->Checksum = 0;
+    icmpHeader->Checksum = CalculateChecksum((PUSHORT)icmpHeader, frameLength - sizeof(ETHERNET_HEADER) - (ipHeader->HeaderLength * 4));
+    ipHeader->Checksum = 0;
+    ipHeader->Checksum = CalculateChecksum((PUSHORT)ipHeader, ipHeader->HeaderLength * 4);
+
+    return newNbl;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PNET_BUFFER_LIST
+CreateTcpRst(
+    _In_ PFILTER_MODULE_CONTEXT FilterModuleContext,
+    _In_ PNET_BUFFER_LIST OriginalNbl
+)
+{
+    // Ваша логика создания TCP RST
+    // Аналогично CreateIcmpEchoReply, скопируйте и адаптируйте
+    // тело вашей старой функции GenerateTcpRstResponse.
+    // Не забудьте установить флаги RST, ACK.
+    PNET_BUFFER_LIST newNbl = NULL;
+    PNET_BUFFER newNb = NULL;
+    PUCHAR newBuffer = NULL;
+    ULONG frameLength = 0;
+
+    PNET_BUFFER originalNb = NET_BUFFER_LIST_FIRST_NB(OriginalNbl);
+    frameLength = NET_BUFFER_CURRENT_MDL_LENGTH(originalNb);
+    PUCHAR originalBuffer = NdisGetDataBuffer(originalNb, frameLength, NULL, 1, 0);
+    if (!originalBuffer) return NULL;
+
+    // Для RST нам не нужен payload, только заголовки
+    ULONG headerLength = sizeof(ETHERNET_HEADER) + sizeof(IPV4_HEADER) + sizeof(TCP_HEADER);
+    if (frameLength < headerLength) return NULL; // Пакет слишком мал
+
+    newNbl = NdisAllocateNetBufferList(FilterModuleContext->NblPool, 0, 0);
+    if (!newNbl) return NULL;
+
+    newNb = NdisAllocateNetBuffer(FilterModuleContext->NbPool, NULL, 0, 0);
+    if (!newNb) {
+        NdisFreeNetBufferList(newNbl, 0);
+        return NULL;
+    }
+    NET_BUFFER_LIST_FIRST_NB(newNbl) = newNb;
+
+    newBuffer = NdisGetDataBuffer(newNb, headerLength, NULL, 1, 0);
+    if (!newBuffer) {
+        NdisFreeNetBufferList(newNbl, 0);
+        return NULL;
+    }
+    
+    RtlCopyMemory(newBuffer, originalBuffer, headerLength);
+    NET_BUFFER_DATA_LENGTH(newNb) = headerLength;
+
+    ETHERNET_HEADER* ethHeader = (ETHERNET_HEADER*)newBuffer;
+    IPV4_HEADER* ipHeader = (IPV4_HEADER*)(newBuffer + sizeof(ETHERNET_HEADER));
+    TCP_HEADER* tcpHeader = (TCP_HEADER*)((PUCHAR)ipHeader + sizeof(IPV4_HEADER));
+
+    // Swap MAC and IP
+    SwapMacAddress(ethHeader->Destination, ethHeader->Source);
+    SwapIpAddress(&ipHeader->SourceAddress, &ipHeader->DestinationAddress);
+    SwapPorts(&tcpHeader->SourcePort, &tcpHeader->DestinationPort);
+
+    // Prepare RST packet
+    ULONG ackNum = ntohl(tcpHeader->SequenceNumber) + 1; // RST/ACK должен подтверждать SYN
+    tcpHeader->SequenceNumber = 0; // RST не имеет sequence number
+    tcpHeader->AcknowledgementNumber = htonl(ackNum);
+    tcpHeader->Flags = TCP_FLAG_RST | TCP_FLAG_ACK;
+    tcpHeader->WindowSize = 0;
+    tcpHeader->UrgentPointer = 0;
+    
+    // Recalculate checksums
+    ipHeader->TotalLength = htons(sizeof(IPV4_HEADER) + sizeof(TCP_HEADER));
+    ipHeader->Checksum = 0;
+    ipHeader->Checksum = CalculateChecksum((PUSHORT)ipHeader, sizeof(IPV4_HEADER));
+    
+    tcpHeader->Checksum = 0;
+    tcpHeader->Checksum = CalculateTcpChecksum(ipHeader, tcpHeader);
+
+    return newNbl;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PNET_BUFFER_LIST
+CreateArpReply(
+    _In_ PFILTER_MODULE_CONTEXT FilterModuleContext,
+    _In_ PNET_BUFFER_LIST OriginalNbl
+)
+{
+    // Ваша логика создания ARP Reply
+    // Аналогично, скопируйте и адаптируйте тело вашей старой
+    // функции GenerateArpResponse. Используйте ваш ARP-кэш.
+    PNET_BUFFER_LIST newNbl = NULL;
+    PNET_BUFFER newNb = NULL;
+    PUCHAR newBuffer = NULL;
+    ULONG frameLength = sizeof(ETHERNET_HEADER) + sizeof(ARP_HEADER);
+
+    PNET_BUFFER originalNb = NET_BUFFER_LIST_FIRST_NB(OriginalNbl);
+    PUCHAR originalBuffer = NdisGetDataBuffer(originalNb, frameLength, NULL, 1, 0);
+    if (!originalBuffer) return NULL;
+
+    newNbl = NdisAllocateNetBufferList(FilterModuleContext->NblPool, 0, 0);
+    if (!newNbl) return NULL;
+
+    newNb = NdisAllocateNetBuffer(FilterModuleContext->NbPool, NULL, 0, 0);
+    if (!newNb) {
+        NdisFreeNetBufferList(newNbl, 0);
+        return NULL;
+    }
+    NET_BUFFER_LIST_FIRST_NB(newNbl) = newNb;
+
+    newBuffer = NdisGetDataBuffer(newNb, frameLength, NULL, 1, 0);
+    if (!newBuffer) {
+        NdisFreeNetBufferList(newNbl, 0);
+        return NULL;
+    }
+    
+    RtlCopyMemory(newBuffer, originalBuffer, frameLength);
+    NET_BUFFER_DATA_LENGTH(newNb) = frameLength;
+
+    ETHERNET_HEADER* ethHeader = (ETHERNET_HEADER*)newBuffer;
+    ARP_HEADER* arpHeader = (ARP_HEADER*)(newBuffer + sizeof(ETHERNET_HEADER));
+
+    // Получаем MAC-адрес из кэша или генерируем новый
+    UCHAR targetMac[ETH_ALEN];
+    ArpCacheGetMac(FilterModuleContext, arpHeader->TargetIP, targetMac);
+
+    // Заполняем ARP Reply
+    arpHeader->Opcode = htons(2); // ARP Reply
+    RtlCopyMemory(arpHeader->TargetMAC, arpHeader->SenderMAC, ETH_ALEN);
+    RtlCopyMemory(arpHeader->TargetIP, arpHeader->SenderIP, 4);
+    RtlCopyMemory(arpHeader->SenderMAC, targetMac, ETH_ALEN);
+    // SenderIP уже правильный (тот, о котором спрашивали)
+
+    // Заполняем Ethernet заголовок
+    RtlCopyMemory(ethHeader->Destination, ethHeader->Source, ETH_ALEN);
+    RtlCopyMemory(ethHeader->Source, targetMac, ETH_ALEN);
+
+    return newNbl;
+}
