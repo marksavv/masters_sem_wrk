@@ -40,6 +40,16 @@ Notes:
 #define FILTER_MAJOR_NDIS_VERSION   NDIS_FILTER_MAJOR_VERSION
 #define FILTER_MINOR_NDIS_VERSION   NDIS_FILTER_MINOR_VERSION
 
+#pragma once
+
+// <<< ДОБАВИТЬ: Директива для правильного выравнивания структур заголовков
+#pragma pack(push, 1)
+
+// <<< ДОБАВИТЬ: Определения констант Ethernet
+#define ETH_ALEN 6
+#define ETHERNET_TYPE_IPV4 0x0800
+#define ETHERNET_TYPE_ARP  0x0806
+
 
 //
 // Global variables
@@ -294,6 +304,38 @@ typedef struct _FILTER_REQUEST
     NDIS_STATUS            Status;
 } FILTER_REQUEST, *PFILTER_REQUEST;
 
+// МБ удалить
+
+#define RESPONSE_TYPE_ICMP_REPLY 1
+#define RESPONSE_TYPE_TCP_RST    2
+#define RESPONSE_TYPE_ARP_REPLY  3
+
+// <<< ДОБАВИТЬ: Константы для кодов операций и типов протоколов
+#define ICMP_ECHO_REQUEST 8
+#define ARP_REQUEST 1
+
+typedef struct _FILTER_REQUEST_CONTEXT
+{
+    PVOID                   FilterModuleContext;
+    PNET_BUFFER_LIST        OriginalNbl;
+    NDIS_IO_WORKITEM        WorkItem;
+    
+    NDIS_HANDLE             TimerObject;
+    UCHAR                   ResponseType;
+
+} FILTER_REQUEST_CONTEXT, *PFILTER_REQUEST_CONTEXT;
+
+typedef struct _FILTER_MODULE_CONTEXT
+{
+    NDIS_HANDLE             FilterHandle;
+    NDIS_HANDLE             NblPool;
+    NDIS_HANDLE             NbPool;
+    // <<< ДОБАВИТЬ ЭТИ ДВА ПОЛЯ
+    LIST_ENTRY              ArpCacheListHead;
+    NDIS_SPIN_LOCK          ArpCacheLock;
+
+} FILTER_MODULE_CONTEXT, *PFILTER_MODULE_CONTEXT;
+
 //
 // Define the filter struct
 //
@@ -451,6 +493,123 @@ filterInternalRequestComplete(
     );
 
 
+// Структуры для заголовков пакетов
+#pragma pack(push, 1)
+typedef struct _IP_HEADER {
+    UCHAR   IHL : 4;
+    UCHAR   Version : 4;
+    UCHAR   Tos;
+    USHORT  TotalLength;
+    USHORT  Id;
+    USHORT  FragOff;
+    UCHAR   TTL;
+    UCHAR   Protocol;
+    USHORT  Checksum;
+    ULONG   SrcIp;
+    ULONG   DstIp;
+} IP_HEADER, *PIP_HEADER;
+
+typedef struct _ICMP_HEADER {
+    UCHAR   Type;
+    UCHAR   Code;
+    USHORT  Checksum;
+    USHORT  Id;
+    USHORT  Seq;
+} ICMP_HEADER, *PICMP_HEADER;
+
+typedef struct _TCP_HEADER {
+    USHORT  SrcPort;
+    USHORT  DstPort;
+    ULONG   SeqNum;
+    ULONG   AckNum;
+    UCHAR   DataOff : 4;
+    UCHAR   Reserved : 4;
+    UCHAR   Flags;
+    USHORT  Window;
+    USHORT  Checksum;
+    USHORT  UrgentPtr;
+} TCP_HEADER, *PTCP_HEADER;
+
+// Структура заголовка Ethernet
+typedef struct _ETHERNET_HEADER {
+    UCHAR Destination[ETH_ALEN];
+    UCHAR Source[ETH_ALEN];
+    USHORT Type;
+} ETHERNET_HEADER, *PETHERNET_HEADER;
+
+// typedef struct _ARP_HEADER {
+//     USHORT  HardwareType;
+//     USHORT  ProtocolType;
+//     UCHAR   HardwareSize;
+//     UCHAR   ProtocolSize;
+//     USHORT  Operation;
+//     UCHAR   SenderMac[6];
+//     ULONG   SenderIp;
+//     UCHAR   TargetMac[6];
+//     ULONG   TargetIp;
+// } ARP_HEADER, *PARP_HEADER;
+
+typedef struct _ARP_HEADER {
+    USHORT HardwareType;
+    USHORT ProtocolType;
+    UCHAR HardwareAddressLength;
+    UCHAR ProtocolAddressLength;
+    USHORT Opcode;
+    UCHAR SenderMAC[ETH_ALEN];
+    UCHAR SenderIP[4];
+    UCHAR TargetMAC[ETH_ALEN];
+    UCHAR TargetIP[4];
+} ARP_HEADER, *PARP_HEADER;
+
+// <<< ДОБАВИТЬ: Определения констант IP
+#define IPPROTO_ICMP 1
+#define IPPROTO_TCP  6
+
+// <<< ДОБАВИТЬ: Структура заголовка IPv4
+typedef struct _IPV4_HEADER {
+    UCHAR HeaderLength : 4;
+    UCHAR Version : 4;
+    UCHAR TypeOfService;
+    USHORT TotalLength;
+    USHORT Identification;
+    USHORT FlagsAndFragmentOffset;
+    UCHAR TimeToLive;
+    UCHAR Protocol;
+    USHORT Checksum;
+    ULONG SourceAddress;
+    ULONG DestinationAddress;
+} IPV4_HEADER, *PIPV4_HEADER;
+#pragma pack(pop)
+
+// Типы ответов
+typedef enum {
+    ICMP_REPLY,
+    TCP_RST,
+    ARP_REPLY
+} REPLY_TYPE;
+
+// Структура для отложенных пакетов
+typedef struct _DELAYED_PACKET {
+    LIST_ENTRY ListEntry;
+    PNET_BUFFER_LIST NetBufferList;
+    REPLY_TYPE ReplyType;
+} DELAYED_PACKET;
+
+// Глобальные переменные
+extern LIST_ENTRY g_PacketQueue;
+extern KSPIN_LOCK g_QueueLock;
+extern KTIMER g_ReplyTimer;
+extern KDPC g_ReplyDpc;
+extern NDIS_HANDLE g_NdisFilterHandle;
+
+// Прототипы функций
+BOOLEAN IsIcmpEchoRequest(PUCHAR PacketData);
+BOOLEAN IsTcpSyn(PUCHAR PacketData);
+BOOLEAN IsArpRequest(PUCHAR PacketData);
+VOID ScheduleFakeReply(PNET_BUFFER_LIST NetBufferList, REPLY_TYPE ReplyType);
+VOID TimerDpcRoutine(PKDPC Dpc, PVOID Context, PVOID Arg1, PVOID Arg2);
+PNET_BUFFER_LIST GenerateFakeReply(PNET_BUFFER_LIST OriginalPacket, REPLY_TYPE ReplyType);
+VOID GenerateStableArpReply(PNET_BUFFER_LIST ArpRequest);
+VOID InitializeTimerAndQueue(VOID);
+
 #endif  //_FILT_H
-
-
